@@ -354,7 +354,9 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now sing-box
+    systemctl enable sing-box
+    # 必须是 restart：重装时服务已在跑，start 对已运行的服务是空操作，旧配置会继续生效
+    systemctl restart sing-box
 }
 
 # ---------- 固定隧道 ----------
@@ -621,7 +623,14 @@ do_uninstall() {
         read -rp "确认卸载 sing-box 与 cloudflared 并删除配置？[y/N] " ans
         [[ "$ans" == "y" || "$ans" == "Y" ]] || { echo "已取消"; exit 0; }
     fi
-    systemctl disable --now sing-box cloudflared 2>/dev/null || true
+    # 逐个停，cloudflared 可能根本没装过（没配隧道时），不能让一个不存在的单元拖垮另一个的停止
+    systemctl stop sing-box 2>/dev/null || true
+    systemctl stop cloudflared 2>/dev/null || true
+    systemctl disable sing-box cloudflared 2>/dev/null || true
+    # 兜底：单元文件删掉后残留进程不会自己死，按精确命令行清理（只认本脚本的两个服务，别处的不碰）
+    pkill -f "^/usr/local/bin/sing-box run -c /etc/sing-box/config.json$" 2>/dev/null || true
+    pkill -f "^/usr/local/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run$" 2>/dev/null || true
+    sleep 1
     rm -f "$SB_SVC_DIR/sing-box.service" "$SB_SVC_DIR/cloudflared.service" \
         "$SB_BIN_DIR/sing-box" "$SB_BIN_DIR/cloudflared" "$SB_BIN_DIR/sb" \
         /etc/sysctl.d/99-sb4-bbr.conf
