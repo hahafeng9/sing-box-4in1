@@ -2,12 +2,22 @@
 
 一键在自己的 VPS 上部署 sing-box，四个协议一次装好：
 
-| 协议 | 传输 | 默认端口 |
+| 协议 | 传输 | 端口 |
 |---|---|---|
-| VLESS + REALITY | TCP + Vision | 443 |
-| VMess + WS | 走 Cloudflare 隧道 | 10086（本机） |
-| Hysteria2 | UDP | 8443 |
-| TUIC v5 | UDP | 8444 |
+| VLESS + REALITY | TCP + Vision | 随机高位端口 |
+| VMess + WS | 走 Cloudflare 隧道 | 随机高位端口（只监听本机，客户端走隧道域名经 CF 443） |
+| Hysteria2 | UDP | 随机高位端口 |
+| TUIC v5 | UDP | 随机高位端口 |
+
+## 端口逻辑
+
+默认不占 443：安装时随机取一个基端口（10000–65000），四个协议依次 +1/+2/+3（参考老王 eooce / 甬哥 sing-box-yg 的做法）。本机 443 留给已有的程序（比如 xray）；客户端走隧道域名时用的 443 是 Cloudflare 边缘的端口，不是 VPS 本机的。
+
+- 四个端口里有被占用的，自动换一组随机端口重试，不会装到一半才报错。
+- 端口先验：还没下载任何东西之前就先确认端口能用。
+- 想自己定端口：菜单 2 自填（填了被占会一直追问，直到给个空闲的），或用环境变量 `SB_REALITY_PORT` 等指定；显式指定的端口被占时报错退出，不会自动改。
+- NAT 机：`SB_BASE_PORT=起点`，四个协议依次占连续 4 个端口（与老王 `PORT=` 同款）。
+- 重装保留 UUID / 密码；旧端口被别的程序占了时自动重随一组（自愈）。
 
 支持 **Cloudflare 固定隧道**：填 token + 域名，VMess 自动走隧道进来，不用在服务器上开 80/443、不用申请证书。token 除了贴 Cloudflare 给的那串，也可以直接给 JSON 形式的 credentials（`{"AccountTag":"...","TunnelSecret":"...","TunnelID":"..."}`）。
 
@@ -30,7 +40,7 @@ bash install.sh install
 ## 固定隧道怎么配
 
 1. Cloudflare Zero Trust → Networks → Tunnels → Create → 选 Cloudflared → 复制 token。
-2. 在隧道里加一条 Public Hostname：域名填你的，Service 填 `http://localhost:10086`（端口按你装的 VMess 端口改）。
+2. 在隧道里加一条 Public Hostname：域名填你的，Service 填 `http://localhost:VMess端口`（VMess 端口是安装时随机挑的，装完 `sb show` 里能看到）。
 3. 跑 `sb` → 选 5，粘贴 token 和域名；或安装时直接传环境变量：
 
 ```bash
@@ -43,10 +53,10 @@ SB_TUNNEL_TOKEN=你的token SB_TUNNEL_DOMAIN=node.example.com bash install.sh in
 
 | 变量 | 说明 | 默认 |
 |---|---|---|
-| `SB_REALITY_PORT` | VLESS+REALITY 端口 | 443 |
-| `SB_VMESS_PORT` | VMess+WS 端口 | 10086 |
-| `SB_HY2_PORT` | Hysteria2 端口 | 8443 |
-| `SB_TUIC_PORT` | TUIC 端口 | 8444 |
+| `SB_REALITY_PORT` | VLESS+REALITY 端口 | 随机基端口 |
+| `SB_VMESS_PORT` | VMess+WS 端口 | 随机基端口+1 |
+| `SB_HY2_PORT` | Hysteria2 端口 | 随机基端口+2 |
+| `SB_TUIC_PORT` | TUIC 端口 | 随机基端口+3 |
 | `SB_BASE_PORT` | NAT 机：以该端口为起点，四个协议依次占连续 4 个端口 | — |
 | `SB_SNI` | Reality / TLS 伪装域名 | www.microsoft.com |
 | `SB_TUNNEL_TOKEN` / `SB_TUNNEL_DOMAIN` | 固定隧道 token（或 JSON credentials）与域名 | — |
@@ -80,7 +90,7 @@ sb uninstall    # 卸载（加 -y 跳过确认）
 
 ## 和老王（eooce）四合一脚本的对比
 
-本脚本参考了老王 sing-box 四合一的公开说明（eooce/Sing-box README），代码是自己写的，不是照抄。用户给的另一条参考视频（nqxA7kFVJi0）看过之后确认讲的不是 sing-box 部署，而是 Lucky STUN + GOST 反向 CDN 回源做线路优化，和部署脚本无关，所以没从里面取东西。对比如下：
+本脚本参考了老王 sing-box 四合一（eooce/Sing-box）和甬哥 sing-box-yg（yonggekkk/sing-box-yg）的公开脚本代码，端口逻辑按他俩的方法改的（随机基端口 +1/+2/+3、被占重随、ss 双协议查占用），其余代码是自己写的，不是照抄。用户给的另一条参考视频（nqxA7kFVJi0）看过之后确认讲的不是 sing-box 部署，而是 Lucky STUN + GOST 反向 CDN 回源做线路优化，和部署脚本无关，所以没从里面取东西。对比如下：
 
 | 能力 | 老王 | 本脚本 |
 |---|---|---|
@@ -94,7 +104,7 @@ sb uninstall    # 卸载（加 -y 跳过确认）
 | NAT 机连续端口 | `PORT` | `SB_BASE_PORT` |
 | 多发行版（Fedora / Alpine / RHEL） | 有 | 只有 Debian / Ubuntu |
 | 纯 IPv6 机器 | 支持 | 支持（链接里 IPv6 自动加方括号） |
-| 安装前端口占用预检 | — | 有，占用的端口直接报出占用进程 |
+| 安装前端口占用预检 | — | 有，下载前就验；自动模式被占重随，显式端口被占才报占用进程退出 |
 
 没做的三项是有意的：哪吒探针用户一般已有独立部署流程，塞进部署脚本会多一个故障面；TG 推送要往脚本里填 bot token，等于多存一份凭据；WARP 解锁分流（GPT/奈飞）超出“部署节点”这个目标。需要哪吒或 WARP 的话，装完再单独配。
 

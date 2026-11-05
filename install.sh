@@ -11,10 +11,14 @@
 #       cloudflared -> github.com/cloudflare/cloudflared/releases
 #   - 支持 Cloudflare 固定隧道（填 token + 域名即可），也可不配隧道直连。
 #   - 生成的 UUID / 密码 / Reality 密钥对全部在本机随机生成，只存在服务器上。
+#   - 端口逻辑（参考老王 eooce / 甬哥 sing-box-yg）：默认不占 443，随机取一个基端口，
+#     四个协议依次 +1/+2/+3；端口被占时自动重随，不会装到一半才报错；显式指定的端口被占才报错退出。
+#   - 配了固定隧道/临时隧道时，VMess+WS 只监听 127.0.0.1，客户端走隧道域名经 Cloudflare 边缘 443，
+#     不用 VPS 本机 443；VLESS+REALITY / Hysteria2 / TUIC 走 VPS 随机高位端口直连。
 #
 # 用法：
 #   bash install.sh                 # 交互菜单（1 是一键安装，只问隧道）
-#   bash install.sh install         # 非交互安装（默认端口，可用环境变量改）
+#   bash install.sh install         # 非交互安装（默认随机端口，可用环境变量改）
 #   bash install.sh show            # 查看节点信息
 #   bash install.sh check           # 自检：服务、配置、端口、探针、隧道
 #   bash install.sh update          # 更新 sing-box 内核
@@ -25,11 +29,11 @@
 #   bash install.sh check --fix     # 自检，失败时自动重启服务后复检
 #
 # 环境变量（安装时可用）：
-#   SB_REALITY_PORT  VLESS+REALITY 端口，默认 443
-#   SB_VMESS_PORT    VMess+WS 端口，默认 10086（配隧道时只监听本机）
-#   SB_HY2_PORT      Hysteria2 端口，默认 8443
-#   SB_TUIC_PORT     TUIC 端口，默认 8444
-#   SB_BASE_PORT     NAT 机可用：以该端口为起点，四个协议依次占用连续 4 个端口
+#   SB_REALITY_PORT  VLESS+REALITY 端口，默认随机（基端口；留空即随机，不默认用 443）
+#   SB_VMESS_PORT    VMess+WS 端口，默认随机基端口+1（配隧道时只监听本机，客户端走隧道域名经 CF 443）
+#   SB_HY2_PORT      Hysteria2 端口，默认随机基端口+2
+#   SB_TUIC_PORT     TUIC 端口，默认随机基端口+3
+#   SB_BASE_PORT     NAT 机可用：以该端口为起点，四个协议依次占用连续 4 个端口（与老王 PORT= 同款）
 #   SB_SNI           Reality/TLS 伪装域名，默认 www.microsoft.com
 #   SB_TUNNEL_TOKEN  固定隧道 token（配了它就同时要配 SB_TUNNEL_DOMAIN；也可直接给 JSON 形式的 credentials）
 #   SB_TUNNEL_DOMAIN 固定隧道域名，如 node.example.com
@@ -89,21 +93,48 @@ detect_os() {
 }
 
 # ---------- 端口 ----------
+# 端口逻辑（参考老王 eooce / 甬哥 sing-box-yg）：
+#   - 不指定端口时：随机取一个基端口（10000-65000），四个协议依次 +1/+2/+3，绝不默认用 443。
+#     443 留给本机已有的程序（如 xray）；客户端走隧道域名时用的是 Cloudflare 边缘的 443。
+#   - SB_BASE_PORT：NAT 机用法，以该端口为起点连续 4 个端口（与老王 PORT= 同款）。
+#   - 显式给 SB_*_PORT：按指定的装，被占时报错退出（不自动改，避免改了用户指定的端口）。
+# PORTS_AUTO=1 表示端口是本轮随机挑的，被占时可以重随；显式端口 / NAT 基端口 / 旧参数文件里的端口都是 0。
+PORTS_AUTO=0
+roll_random_ports() {
+    local base
+    base=$(shuf -i 10000-65000 -n 1)
+    REALITY_PORT="$base"
+    VMESS_PORT=$((base + 1))
+    HY2_PORT=$((base + 2))
+    TUIC_PORT=$((base + 3))
+}
+
 resolve_ports() {
     if [[ -n "${SB_BASE_PORT:-}" ]]; then
         REALITY_PORT="$SB_BASE_PORT"
         VMESS_PORT=$((SB_BASE_PORT + 1))
         HY2_PORT=$((SB_BASE_PORT + 2))
         TUIC_PORT=$((SB_BASE_PORT + 3))
+        PORTS_AUTO=0
+    elif [[ -n "${SB_REALITY_PORT:-}" || -n "${SB_VMESS_PORT:-}" || -n "${SB_HY2_PORT:-}" || -n "${SB_TUIC_PORT:-}" ]]; then
+        # 只给了一部分时，未给的用随机基端口的对应位置补齐
+        local base
+        base=$(shuf -i 10000-65000 -n 1)
+        REALITY_PORT="${SB_REALITY_PORT:-$base}"
+        VMESS_PORT="${SB_VMESS_PORT:-$((base + 1))}"
+        HY2_PORT="${SB_HY2_PORT:-$((base + 2))}"
+        TUIC_PORT="${SB_TUIC_PORT:-$((base + 3))}"
+        PORTS_AUTO=0
     else
-        REALITY_PORT="${SB_REALITY_PORT:-443}"
-        VMESS_PORT="${SB_VMESS_PORT:-10086}"
-        HY2_PORT="${SB_HY2_PORT:-8443}"
-        TUIC_PORT="${SB_TUIC_PORT:-8444}"
+        roll_random_ports
+        PORTS_AUTO=1
     fi
     for p in "$REALITY_PORT" "$VMESS_PORT" "$HY2_PORT" "$TUIC_PORT"; do
         [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 1 && p <= 65535 )) || die "端口不合法：$p"
     done
+    [[ "$REALITY_PORT" != "$VMESS_PORT" && "$REALITY_PORT" != "$HY2_PORT" && "$REALITY_PORT" != "$TUIC_PORT" \
+        && "$VMESS_PORT" != "$HY2_PORT" && "$VMESS_PORT" != "$TUIC_PORT" && "$HY2_PORT" != "$TUIC_PORT" ]] \
+        || die "四个端口不能重复：$REALITY_PORT/$VMESS_PORT/$HY2_PORT/$TUIC_PORT"
 }
 
 # ---------- 公网 IP ----------
@@ -555,9 +586,15 @@ gen_links() {
     if (( vmess_pending == 1 )); then
         vmess="# VMess-WS：临时隧道域名还没拿到，等一会再运行 sb show"
     else
+        local vmess_port="$VMESS_PORT"
+        # 走隧道（固定/临时）时，客户端连的是隧道域名，Cloudflare 边缘只认 443；
+        # 本机 VMess 只监听 127.0.0.1:$VMESS_PORT，不用 VPS 本机 443。
+        if [[ -n "${TUNNEL_DOMAIN:-}" || -n "${ARGO:-}" ]]; then
+            vmess_port=443
+        fi
         local vmess_json
         vmess_json=$(jq -n -c \
-            --arg ps "${NODE_NAME}-VMess-WS" --arg add "$vmess_host" --argjson port "$VMESS_PORT" \
+            --arg ps "${NODE_NAME}-VMess-WS" --arg add "$vmess_host" --argjson port "$vmess_port" \
             --arg id "$UUID" --arg host "$vmess_host" --arg tls "$vmess_tls" --arg sni "$vmess_sni" \
             '{v:"2", ps:$ps, add:$add, port:$port, id:$id, aid:"0", scy:"auto", net:"ws", type:"none", host:$host, path:"/vmess", tls:$tls, sni:$sni}')
         vmess="vmess://$(echo -n "$vmess_json" | base64 -w0)"
@@ -643,7 +680,11 @@ show_info() {
     blue "================ 节点信息 ================"
     echo "服务器 IP：$ip"
     echo "VLESS+REALITY 端口：$REALITY_PORT（TCP）"
-    echo "VMess+WS 端口：$VMESS_PORT（TCP）$([[ -n "${TUNNEL_DOMAIN:-}" ]] && echo "，经隧道域名 $TUNNEL_DOMAIN")"
+    if [[ -n "${TUNNEL_DOMAIN:-}" || -n "${ARGO:-}" ]]; then
+        echo "VMess+WS：本机只监听 127.0.0.1:$VMESS_PORT，客户端走隧道域名经 Cloudflare 443"
+    else
+        echo "VMess+WS 端口：$VMESS_PORT（TCP）"
+    fi
     echo "Hysteria2 端口：$HY2_PORT（UDP）"
     echo "TUIC 端口：$TUIC_PORT（UDP）"
     [[ -n "${TUNNEL_DOMAIN:-}" ]] && echo "固定隧道：$TUNNEL_DOMAIN"
@@ -683,26 +724,65 @@ install_shortcut() {
 # ---------- 动作 ----------
 # ---------- 端口占用预检 ----------
 # 已有安装时，旧 sing-box 自己占着端口是正常的，按它的 PID 排除
-check_ports_free() {
-    command -v ss >/dev/null 2>&1 || return 0
-    local old_pid
+# ---------- 端口占用预检 ----------
+# 单个端口是否空闲（proto: tcp/udp；ss 双协议查法参考甬哥 sb.sh）。
+# 重装时排除自家旧 sing-box 进程占的端口（旧服务还跑着时，它占的端口不算被占）。
+port_free() {
+    local proto="$1" p="$2"
+    local old_pid line
     old_pid=$(systemctl show -p MainPID --value sing-box 2>/dev/null || echo 0)
-    local p line
-    for p in "$REALITY_PORT" "$VMESS_PORT"; do
+    if [[ "$proto" == "tcp" ]]; then
         line=$(ss -tlnp 2>/dev/null | grep ":$p " || true)
-        if [[ -n "$line" ]] && ! echo "$line" | grep -q "pid=$old_pid,"; then
-            red "端口 $p 已被占用："
-            echo "$line"
-            die "先释放 $p（或换个端口）再装"
+    else
+        line=$(ss -ulnp 2>/dev/null | grep ":$p " || true)
+    fi
+    [[ -z "$line" ]] && return 0
+    echo "$line" | grep -q "pid=$old_pid," && return 0
+    return 1
+}
+
+ports_all_free() {
+    port_free tcp "$REALITY_PORT" || return 1
+    port_free tcp "$VMESS_PORT" || return 1
+    port_free udp "$HY2_PORT" || return 1
+    port_free udp "$TUIC_PORT" || return 1
+    return 0
+}
+
+# 占用时：自动模式重随一组随机端口（参考老王/甬哥：被占就换，不直接报错退出）；
+# 显式指定的端口被占时报错退出，并打印占用进程。
+ensure_ports_free() {
+    local tries=0 spec proto p
+    while ! ports_all_free; do
+        if [[ "$PORTS_AUTO" == "1" ]]; then
+            tries=$((tries + 1))
+            (( tries > 50 )) && die "随机端口连续 50 次都被占用，请检查本机端口或用菜单 2 自填端口"
+            yellow "四个端口中有被占用的，换一组随机端口重试"
+            roll_random_ports
+        else
+            for spec in "tcp $REALITY_PORT" "tcp $VMESS_PORT" "udp $HY2_PORT" "udp $TUIC_PORT"; do
+                proto="${spec%% *}"; p="${spec##* }"
+                if ! port_free "$proto" "$p"; then
+                    red "端口 $p 已被占用："
+                    if [[ "$proto" == "tcp" ]]; then ss -tlnp 2>/dev/null | grep ":$p " || true
+                    else ss -ulnp 2>/dev/null | grep ":$p " || true; fi
+                    die "先释放 $p（或去掉端口变量，让脚本随机挑一组空闲端口）再装"
+                fi
+            done
+            die "端口检查失败"
         fi
     done
-    for p in "$HY2_PORT" "$TUIC_PORT"; do
-        line=$(ss -ulnp 2>/dev/null | grep ":$p " || true)
-        if [[ -n "$line" ]] && ! echo "$line" | grep -q "pid=$old_pid,"; then
-            red "端口 $p 已被占用："
-            echo "$line"
-            die "先释放 $p（或换个端口）再装"
-        fi
+}
+
+# 交互问一个端口：回车=随机；填了被占就一直追问（甬哥同款）。只把最终端口打到 stdout，其余提示走 stderr。
+ask_free_port() {
+    local prompt="$1" proto="$2" val
+    while true; do
+        read -rp "$prompt" val
+        [[ -z "$val" ]] && { echo ""; return 0; }
+        if ! [[ "$val" =~ ^[0-9]+$ ]] || (( val < 1 || val > 65535 )); then red "端口不合法：$val" >&2; continue; fi
+        if port_free "$proto" "$val"; then echo "$val"; return 0; fi
+        red "端口 $val 已被占用，换一个" >&2
     done
 }
 
@@ -719,6 +799,11 @@ do_install() {
     if [[ -n "$TUNNEL_DOMAIN" && -n "$ARGO" ]]; then
         die "固定隧道与临时隧道二选一，不要同时给"
     fi
+    # 端口先验：还没下载任何东西之前就确认端口能用（显式端口被占直接报错；自动模式重随）。
+    # 重装且没显式给端口时跳过这一步（旧端口稍后在参数文件里确认，避免白白重随一组用不上的随机端口）。
+    if [[ ! -f "$PARAMS_FILE" ]] || [[ -n "${SB_BASE_PORT:-}" || -n "${SB_REALITY_PORT:-}" || -n "${SB_VMESS_PORT:-}" || -n "${SB_HY2_PORT:-}" || -n "${SB_TUIC_PORT:-}" ]]; then
+        ensure_ports_free
+    fi
     install_deps
     install_singbox
     if [[ -f "$PARAMS_FILE" ]]; then
@@ -731,11 +816,20 @@ do_install() {
         ARGO="${SB_ARGO:-${ARGO:-}}"
         if [[ -n "${SB_BASE_PORT:-}" || -n "${SB_REALITY_PORT:-}" || -n "${SB_VMESS_PORT:-}" || -n "${SB_HY2_PORT:-}" || -n "${SB_TUIC_PORT:-}" ]]; then
             resolve_ports
+        else
+            # 重装默认保留旧端口；旧端口被别的程序占了（比如上次装失败留下的 443），自动重随一组
+            if ! ports_all_free; then
+                yellow "旧端口已被别的程序占用，重新随机挑一组端口（UUID / 密码不变）"
+                PORTS_AUTO=1
+                roll_random_ports
+            else
+                PORTS_AUTO=0
+            fi
         fi
     else
         gen_secrets
     fi
-    check_ports_free
+    ensure_ports_free
     gen_cert
     save_params
     write_config
@@ -848,7 +942,7 @@ menu() {
             echo "sing-box：未安装"
         fi
         echo "------------------------------------------"
-        echo "1. 一键安装（默认端口 443 / 10086 / 8443 / 8444）"
+        echo "1. 一键安装（随机端口，不占 443）"
         echo "2. 自定义安装（自填端口、伪装域名）"
         echo "3. 查看节点信息"
         echo "4. 自检（服务、端口、探针、隧道）"
@@ -876,12 +970,12 @@ menu() {
                 do_install
                 ;;
             2)
-                # 自定义安装：端口与伪装域名现问现装
+                # 自定义安装：端口与伪装域名现问现装（留空=随机；填了被占会一直追问）
                 SB_ARGO=""
-                read -rp "VLESS+REALITY 端口 [默认 443]：" p; SB_REALITY_PORT="${p:-443}"
-                read -rp "VMess+WS 端口 [默认 10086]：" p; SB_VMESS_PORT="${p:-10086}"
-                read -rp "Hysteria2 端口 [默认 8443]：" p; SB_HY2_PORT="${p:-8443}"
-                read -rp "TUIC 端口 [默认 8444]：" p; SB_TUIC_PORT="${p:-8444}"
+                SB_REALITY_PORT=$(ask_free_port "VLESS+REALITY 端口 [留空随机]：" tcp)
+                SB_VMESS_PORT=$(ask_free_port "VMess+WS 端口 [留空随机]：" tcp)
+                SB_HY2_PORT=$(ask_free_port "Hysteria2 端口 [留空随机]：" udp)
+                SB_TUIC_PORT=$(ask_free_port "TUIC 端口 [留空随机]：" udp)
                 read -rp "伪装域名 SNI [默认 www.microsoft.com]：" p; SB_SNI="${p:-www.microsoft.com}"
                 read -rp "固定隧道 token（没有直接回车跳过）：" p; SB_TUNNEL_TOKEN="$p"
                 if [[ -n "$p" ]]; then
