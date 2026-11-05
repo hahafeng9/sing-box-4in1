@@ -15,6 +15,7 @@
 #     四个协议依次 +1/+2/+3；端口被占时自动重随，不会装到一半才报错；显式指定的端口被占才报错退出。
 #   - 配了固定隧道/临时隧道时，VMess+WS 只监听 127.0.0.1，客户端走隧道域名经 Cloudflare 边缘 443，
 #     不用 VPS 本机 443；VLESS+REALITY / Hysteria2 / TUIC 走 VPS 随机高位端口直连。
+#   - cloudflared 强制走 http2（TCP 443）：默认 QUIC 走 UDP 7844，很多机房出站 UDP 被限会导致隧道注册不上。
 #
 # 用法：
 #   bash install.sh                 # 交互菜单（1 是一键安装，只问隧道）
@@ -427,6 +428,9 @@ EOF
     cat > "$SB_CF_DIR/config.yml" <<EOF
 tunnel: $tunnel_id
 credentials-file: $SB_CF_DIR/creds.json
+# 强制走 http2（TCP 443）：默认 QUIC 走 UDP 7844，很多机房/防火墙出站 UDP 被限，
+# 隧道注册不上就 530。参考老王 eooce / 甬哥脚本，两家固定隧道都强制 http2。
+protocol: http2
 no-autoupdate: true
 ingress:
   - hostname: $TUNNEL_DOMAIN
@@ -442,7 +446,7 @@ Wants=sing-box.service
 
 [Service]
 User=root
-ExecStart=$SB_BIN_DIR/cloudflared tunnel --config $SB_CF_DIR/config.yml run
+ExecStart=$SB_BIN_DIR/cloudflared tunnel --config $SB_CF_DIR/config.yml --edge-ip-version auto run
 Restart=always
 RestartSec=5s
 
@@ -503,7 +507,7 @@ Wants=sing-box.service
 
 [Service]
 User=root
-ExecStart=/bin/sh -c '/usr/local/bin/cloudflared tunnel --url http://localhost:$VMESS_PORT --no-autoupdate >> $SB_CF_DIR/argo.log 2>&1'
+ExecStart=/bin/sh -c '/usr/local/bin/cloudflared tunnel --url http://localhost:$VMESS_PORT --edge-ip-version auto --no-autoupdate --protocol http2 >> $SB_CF_DIR/argo.log 2>&1'
 Restart=always
 RestartSec=5s
 

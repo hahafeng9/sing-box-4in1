@@ -19,7 +19,7 @@
 - NAT 机：`SB_BASE_PORT=起点`，四个协议依次占连续 4 个端口（与老王 `PORT=` 同款）。
 - 重装保留 UUID / 密码；旧端口被别的程序占了时自动重随一组（自愈）。
 
-支持 **Cloudflare 固定隧道**：填 token + 域名，VMess 自动走隧道进来，不用在服务器上开 80/443、不用申请证书。token 除了贴 Cloudflare 给的那串，也可以直接给 JSON 形式的 credentials（`{"AccountTag":"...","TunnelSecret":"...","TunnelID":"..."}`）。
+支持 **Cloudflare 固定隧道**：填 token + 域名，VMess 自动走隧道进来，不用在服务器上开 80/443、不用申请证书。token 除了贴 Cloudflare 给的那串，也可以直接给 JSON 形式的 credentials（`{"AccountTag":"...","TunnelSecret":"...","TunnelID":"..."}`）。cloudflared 强制走 http2（TCP 443）：默认 QUIC 走 UDP 7844，很多机房/防火墙出站 UDP 被限，隧道会注册不上（表现为 530），所以固定隧道的 `config.yml` 里写了 `protocol: http2`，临时隧道命令行也加了 `--protocol http2`。
 
 没有域名也可以用 **临时隧道**：安装时选“用临时隧道”，cloudflared 自动分配 `xxx.trycloudflare.com` 域名，VMess 照样走隧道。临时隧道域名每次重启会变，以 `sb show` 显示的为准；想固定下来就改用固定隧道。
 
