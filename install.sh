@@ -418,7 +418,9 @@ EOF
     if systemctl is-active -q cloudflared; then
         green "cloudflared 已启动"
     else
-        red "cloudflared 启动失败，看日志：journalctl -u cloudflared -n 50"
+        red "cloudflared 启动失败，最近日志："
+        journalctl -u cloudflared -n 20 --no-pager 2>/dev/null || true
+        red "看日志：journalctl -u cloudflared -n 50"
     fi
 }
 
@@ -554,6 +556,31 @@ install_shortcut() {
 }
 
 # ---------- 动作 ----------
+# ---------- 端口占用预检 ----------
+# 已有安装时，旧 sing-box 自己占着端口是正常的，按它的 PID 排除
+check_ports_free() {
+    command -v ss >/dev/null 2>&1 || return 0
+    local old_pid
+    old_pid=$(systemctl show -p MainPID --value sing-box 2>/dev/null || echo 0)
+    local p line
+    for p in "$REALITY_PORT" "$VMESS_PORT"; do
+        line=$(ss -tlnp 2>/dev/null | grep ":$p " || true)
+        if [[ -n "$line" ]] && ! echo "$line" | grep -q "pid=$old_pid,"; then
+            red "端口 $p 已被占用："
+            echo "$line"
+            die "先释放 $p（或换个端口）再装"
+        fi
+    done
+    for p in "$HY2_PORT" "$TUIC_PORT"; do
+        line=$(ss -ulnp 2>/dev/null | grep ":$p " || true)
+        if [[ -n "$line" ]] && ! echo "$line" | grep -q "pid=$old_pid,"; then
+            red "端口 $p 已被占用："
+            echo "$line"
+            die "先释放 $p（或换个端口）再装"
+        fi
+    done
+}
+
 do_install() {
     check_root; check_systemd; detect_os; detect_arch; resolve_ports
     SNI="${SB_SNI:-$SNI}"
@@ -578,6 +605,7 @@ do_install() {
     else
         gen_secrets
     fi
+    check_ports_free
     gen_cert
     save_params
     write_config
@@ -598,7 +626,11 @@ do_install() {
         yellow "请在云厂商安全组 / 防火墙放行：TCP $REALITY_PORT、$VMESS_PORT，UDP $HY2_PORT、$TUIC_PORT"
     fi
     sleep 2
-    systemctl is-active -q sing-box || die "sing-box 启动失败，看日志：journalctl -u sing-box -n 50"
+    if ! systemctl is-active -q sing-box; then
+        red "sing-box 启动失败，最近日志："
+        journalctl -u sing-box -n 20 --no-pager 2>/dev/null || true
+        die "见上面日志（常见原因：端口被别的程序占了）"
+    fi
     green "sing-box 安装完成并已启动"
     show_info
     do_check || yellow "自检有失败项，见上面红字"
