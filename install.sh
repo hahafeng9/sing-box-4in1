@@ -21,6 +21,8 @@
 #   bash install.sh restart         # 重启服务
 #   bash install.sh uninstall       # 卸载（加 -y 跳过确认）
 #   bash install.sh tunnel          # 添加 / 更换固定隧道（交互输入 token 与域名）
+#   bash install.sh argo            # 启用临时隧道（无需域名）
+#   bash install.sh check --fix     # 自检，失败时自动重启服务后复检
 #
 # 环境变量（安装时可用）：
 #   SB_REALITY_PORT  VLESS+REALITY 端口，默认 443
@@ -29,8 +31,9 @@
 #   SB_TUIC_PORT     TUIC 端口，默认 8444
 #   SB_BASE_PORT     NAT 机可用：以该端口为起点，四个协议依次占用连续 4 个端口
 #   SB_SNI           Reality/TLS 伪装域名，默认 www.microsoft.com
-#   SB_TUNNEL_TOKEN  固定隧道 token（配了它就同时要配 SB_TUNNEL_DOMAIN）
+#   SB_TUNNEL_TOKEN  固定隧道 token（配了它就同时要配 SB_TUNNEL_DOMAIN；也可直接给 JSON 形式的 credentials）
 #   SB_TUNNEL_DOMAIN 固定隧道域名，如 node.example.com
+#   SB_ARGO          设为 1 启用临时隧道（无需域名，cloudflared 自动分配 trycloudflare.com 域名；与固定隧道二选一）
 #   SB_NODE_NAME          节点名前缀，默认 sb4
 #   SB_VERSION       指定 sing-box 版本，如 1.14.4（默认取最新稳定版）
 #
@@ -145,7 +148,7 @@ download() {
 latest_singbox_version() {
     local ver=""
     ver=$(curl -fsS -m 10 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
-        | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
+        | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//' || true)
     if [[ -z "$ver" ]]; then
         yellow "GitHub API 取最新版失败，改用已知稳定版 $FALLBACK_VERSION"
         ver="$FALLBACK_VERSION"
@@ -245,6 +248,7 @@ SNI="$SNI"
 NODE_NAME="$NODE_NAME"
 TUNNEL_TOKEN="${TUNNEL_TOKEN:-}"
 TUNNEL_DOMAIN="${TUNNEL_DOMAIN:-}"
+ARGO="${ARGO:-}"
 EOF
     chmod 600 "$PARAMS_FILE"
 }
@@ -255,9 +259,9 @@ load_params() {
 }
 
 write_config() {
-    # 配了隧道：VMess 只监听本机，走隧道进来；没配：直接监听公网端口
+    # 配了隧道（固定或临时）：VMess 只监听本机，走隧道进来；没配：直接监听公网端口
     local vmess_listen="0.0.0.0"
-    [[ -n "${TUNNEL_DOMAIN:-}" ]] && vmess_listen="127.0.0.1"
+    [[ -n "${TUNNEL_DOMAIN:-}" || -n "${ARGO:-}" ]] && vmess_listen="127.0.0.1"
     mkdir -p "$SB_HOME"
     # 旧配置先备份，绝不直接覆盖丢掉
     if [[ -f "$SB_HOME/config.json" ]]; then
@@ -358,24 +362,33 @@ EOF
     systemctl daemon-reload
     systemctl enable sing-box
     # 必须是 restart：重装时服务已在跑，start 对已运行的服务是空操作，旧配置会继续生效
-    systemctl restart sing-box
+    # restart 失败不直接炸脚本（set -e 下会跳过后面的报错输出），交给调用方的状态检查统一报日志
+    systemctl restart sing-box || true
 }
 
 # ---------- 固定隧道 ----------
 write_tunnel() {
     # TUNNEL_TOKEN / TUNNEL_DOMAIN 由调用方保证非空
+    # TUNNEL_TOKEN 两种形式都认：token（base64 JSON）或 JSON credentials（{"AccountTag","TunnelSecret","TunnelID"}）
     install_cloudflared
     mkdir -p "$SB_CF_DIR"
     # token 是 base64(JSON{a,t,s})，cloudflared 配置里 tunnel: 不能直接放 token
     # （会当成 tunnel ID 解析并索要 origin cert），要解成 credentials 文件
-    local b64 cred_json tunnel_id tunnel_secret account_tag
-    b64=$(echo -n "$TUNNEL_TOKEN" | tr '_-' '/+')
-    while (( ${#b64} % 4 != 0 )); do b64="${b64}="; done
-    cred_json=$(echo -n "$b64" | base64 -d 2>/dev/null) || die "隧道 token 解码失败"
-    tunnel_id=$(echo "$cred_json" | jq -r '.t // empty')
-    tunnel_secret=$(echo "$cred_json" | jq -r '.s // empty')
-    account_tag=$(echo "$cred_json" | jq -r '.a // empty')
-    [[ -n "$tunnel_id" && -n "$tunnel_secret" && -n "$account_tag" ]] || die "隧道 token 格式不对（缺 a/t/s）"
+    local tunnel_id tunnel_secret account_tag
+    if [[ "$TUNNEL_TOKEN" == \{* ]]; then
+        tunnel_id=$(echo "$TUNNEL_TOKEN" | jq -r '.TunnelID // empty')
+        tunnel_secret=$(echo "$TUNNEL_TOKEN" | jq -r '.TunnelSecret // empty')
+        account_tag=$(echo "$TUNNEL_TOKEN" | jq -r '.AccountTag // empty')
+    else
+        local b64 cred_json
+        b64=$(echo -n "$TUNNEL_TOKEN" | tr '_-' '/+')
+        while (( ${#b64} % 4 != 0 )); do b64="${b64}="; done
+        cred_json=$(echo -n "$b64" | base64 -d 2>/dev/null) || die "隧道 token 解码失败"
+        tunnel_id=$(echo "$cred_json" | jq -r '.t // empty')
+        tunnel_secret=$(echo "$cred_json" | jq -r '.s // empty')
+        account_tag=$(echo "$cred_json" | jq -r '.a // empty')
+    fi
+    [[ -n "$tunnel_id" && -n "$tunnel_secret" && -n "$account_tag" ]] || die "隧道 token 格式不对（缺 a/t/s 或 AccountTag/TunnelSecret/TunnelID）"
     cat > "$SB_CF_DIR/creds.json" <<EOF
 {"AccountTag":"$account_tag","TunnelID":"$tunnel_id","TunnelSecret":"$tunnel_secret"}
 EOF
@@ -408,7 +421,7 @@ EOF
     systemctl daemon-reload
     systemctl enable cloudflared
     # 必须是 restart：换隧道重跑时服务已在跑，start 对已运行的服务是空操作，旧配置会继续生效
-    systemctl restart cloudflared
+    systemctl restart cloudflared || true
     # 连接器启动后还要握手，轮询最多 20 秒再下结论
     local i
     for i in $(seq 1 10); do
@@ -428,13 +441,75 @@ remove_tunnel() {
     check_root; check_systemd
     load_params
     systemctl disable --now cloudflared 2>/dev/null || true
-    rm -f "$SB_SVC_DIR/cloudflared.service" "$SB_CF_DIR/config.yml"
+    systemctl disable --now cloudflared-argo 2>/dev/null || true
+    rm -f "$SB_SVC_DIR/cloudflared.service" "$SB_SVC_DIR/cloudflared-argo.service" \
+        "$SB_CF_DIR/config.yml" "$SB_CF_DIR/creds.json" "$SB_CF_DIR/argo.log"
     systemctl daemon-reload
-    TUNNEL_TOKEN=""; TUNNEL_DOMAIN=""
+    TUNNEL_TOKEN=""; TUNNEL_DOMAIN=""; ARGO=""
     save_params
     write_config
     systemctl restart sing-box
     green "隧道已移除，VMess 改回直连"
+}
+
+# ---------- 临时隧道 ----------
+# 无需域名：cloudflared 自动分配 xxx.trycloudflare.com 域名，重启后域名会变，以 sb show 为准
+get_argo_domain() {
+    # 注意：grep 找不到时返回 1，脚本开了 pipefail，不加 || true 会在 set -e 下直接炸掉调用方
+    grep -oE 'https://[A-Za-z0-9.-]+\.trycloudflare\.com' "$SB_CF_DIR/argo.log" 2>/dev/null \
+        | tail -1 | sed 's#https://##' || true
+}
+
+write_argo() {
+    install_cloudflared
+    mkdir -p "$SB_CF_DIR"
+    touch "$SB_CF_DIR/argo.log"
+    cat > "$SB_SVC_DIR/cloudflared-argo.service" <<EOF
+[Unit]
+Description=Cloudflare Tunnel temporary (sing-box VMess)
+After=network.target sing-box.service
+Wants=sing-box.service
+
+[Service]
+User=root
+ExecStart=/bin/sh -c '/usr/local/bin/cloudflared tunnel --url http://localhost:$VMESS_PORT --no-autoupdate >> $SB_CF_DIR/argo.log 2>&1'
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable cloudflared-argo
+    # restart 失败不直接炸脚本（临时隧道连不上边缘时进程会退出、systemd 认为启动失败），交给后面的轮询与状态检查
+    systemctl restart cloudflared-argo || true
+    # 等 cloudflared 在日志里打出分配到的域名，最多等 60 秒
+    local i d
+    for i in $(seq 1 12); do
+        sleep 5
+        d=$(get_argo_domain)
+        if [[ -n "$d" ]]; then
+            green "临时隧道域名：$d"
+            return 0
+        fi
+    done
+    yellow "临时隧道 60 秒还没拿到域名，服务在重试，稍等再运行 sb show"
+    yellow "看日志：tail -20 $SB_CF_DIR/argo.log"
+}
+
+do_argo() {
+    check_root; check_systemd
+    load_params
+    if [[ -n "${TUNNEL_DOMAIN:-}" ]]; then
+        yellow "已配固定隧道 $TUNNEL_DOMAIN，临时隧道不再启用（先用菜单 6 移除固定隧道）"
+        return 0
+    fi
+    ARGO=1
+    save_params
+    write_config
+    systemctl restart sing-box || true
+    write_argo
+    show_info
 }
 
 # ---------- BBR ----------
@@ -455,22 +530,40 @@ EOF
 }
 
 # ---------- 链接与订阅 ----------
+# IPv6 地址放进链接里要加方括号，否则冒号会和端口冒号混淆（纯 IPv6 机器上不加就全是坏链接）
+bracket_ip() {
+    if [[ "$1" == *:* ]]; then echo "[$1]"; else echo "$1"; fi
+}
+
 gen_links() {
     # IP 由调用方算一次传进来（避免同一脚本里两次查询拿到不同出口 IP）
     local ip="${1:-$(get_ip)}"
-    local vmess_host="$ip" vmess_tls="none" vmess_sni=""
+    local bip; bip=$(bracket_ip "$ip")
+    local vmess_host="$ip" vmess_tls="none" vmess_sni="" vmess_pending=0
     if [[ -n "${TUNNEL_DOMAIN:-}" ]]; then
         vmess_host="$TUNNEL_DOMAIN"; vmess_tls="tls"; vmess_sni="$TUNNEL_DOMAIN"
+    elif [[ -n "${ARGO:-}" ]]; then
+        vmess_host=$(get_argo_domain)
+        if [[ -n "$vmess_host" ]]; then
+            vmess_tls="tls"; vmess_sni="$vmess_host"
+        else
+            vmess_pending=1
+        fi
     fi
-    local vless="vless://${UUID}@${ip}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}-VLESS-REALITY"
-    local vmess_json
-    vmess_json=$(jq -n -c \
-        --arg ps "${NODE_NAME}-VMess-WS" --arg add "$vmess_host" --argjson port "$VMESS_PORT" \
-        --arg id "$UUID" --arg host "$vmess_host" --arg tls "$vmess_tls" --arg sni "$vmess_sni" \
-        '{v:"2", ps:$ps, add:$add, port:$port, id:$id, aid:"0", scy:"auto", net:"ws", type:"none", host:$host, path:"/vmess", tls:$tls, sni:$sni}')
-    local vmess="vmess://$(echo -n "$vmess_json" | base64 -w0)"
-    local hy2="hysteria2://${HY2_PASS}@${ip}:${HY2_PORT}/?sni=${SNI}&insecure=1#${NODE_NAME}-HY2"
-    local tuic="tuic://${UUID}:${TUIC_PASS}@${ip}:${TUIC_PORT}/?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${SNI}&allow_insecure=1#${NODE_NAME}-TUIC"
+    local vless="vless://${UUID}@${bip}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${SHORT_ID}&type=tcp#${NODE_NAME}-VLESS-REALITY"
+    local vmess
+    if (( vmess_pending == 1 )); then
+        vmess="# VMess-WS：临时隧道域名还没拿到，等一会再运行 sb show"
+    else
+        local vmess_json
+        vmess_json=$(jq -n -c \
+            --arg ps "${NODE_NAME}-VMess-WS" --arg add "$vmess_host" --argjson port "$VMESS_PORT" \
+            --arg id "$UUID" --arg host "$vmess_host" --arg tls "$vmess_tls" --arg sni "$vmess_sni" \
+            '{v:"2", ps:$ps, add:$add, port:$port, id:$id, aid:"0", scy:"auto", net:"ws", type:"none", host:$host, path:"/vmess", tls:$tls, sni:$sni}')
+        vmess="vmess://$(echo -n "$vmess_json" | base64 -w0)"
+    fi
+    local hy2="hysteria2://${HY2_PASS}@${bip}:${HY2_PORT}/?sni=${SNI}&insecure=1#${NODE_NAME}-HY2"
+    local tuic="tuic://${UUID}:${TUIC_PASS}@${bip}:${TUIC_PORT}/?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=${SNI}&allow_insecure=1#${NODE_NAME}-TUIC"
     {
         echo "$vless"; echo "$vmess"; echo "$hy2"; echo "$tuic"
     } > "$LINKS_FILE"
@@ -480,10 +573,12 @@ gen_links() {
 
 # ---------- 自检 ----------
 # 查服务、配置、端口监听、VMess 探针、隧道探针，逐项打勾/打叉。
-# 安装完自动跑一次；平时随时 sb check。
+# 安装完自动跑一次；平时随时 sb check；sb check --fix 会在失败时重启服务后复检一次。
 do_check() {
     check_root
     load_params
+    local fix=0
+    [[ "${1:-}" == "--fix" ]] && fix=1
     local ok=0 fail=0
     say() {
         if [[ "$1" == "ok" ]]; then green "  ✓ $2"; ok=$((ok + 1));
@@ -501,20 +596,43 @@ do_check() {
     if ss -uln 2>/dev/null | grep -q ":$HY2_PORT "; then say ok "Hysteria2 端口 $HY2_PORT 监听中"; else say fail "Hysteria2 端口 $HY2_PORT 未监听"; fi
     if ss -uln 2>/dev/null | grep -q ":$TUIC_PORT "; then say ok "TUIC 端口 $TUIC_PORT 监听中"; else say fail "TUIC 端口 $TUIC_PORT 未监听"; fi
     local code
-    code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:$VMESS_PORT/vmess" 2>/dev/null || echo 000)
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:$VMESS_PORT/vmess" 2>/dev/null || true)
+    [[ -z "$code" ]] && code="000"
     if [[ "$code" == "400" ]]; then say ok "VMess+WS 本地探针回 400"; else say fail "VMess+WS 本地探针回 $code（应为 400）"; fi
     if [[ -n "${TUNNEL_DOMAIN:-}" ]]; then
         if systemctl is-active -q cloudflared; then say ok "cloudflared 运行中"; else say fail "cloudflared 未运行"; fi
-        code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 "https://$TUNNEL_DOMAIN/vmess" 2>/dev/null || echo 000)
+        code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 "https://$TUNNEL_DOMAIN/vmess" 2>/dev/null || true)
+        [[ -z "$code" ]] && code="000"
         if [[ "$code" == "400" ]]; then say ok "隧道域名探针回 400"; else say fail "隧道域名探针回 $code（应为 400）"; fi
+    elif [[ -n "${ARGO:-}" ]]; then
+        if systemctl is-active -q cloudflared-argo; then say ok "cloudflared 临时隧道运行中"; else say fail "cloudflared 临时隧道未运行"; fi
+        local ad; ad=$(get_argo_domain)
+        if [[ -n "$ad" ]]; then
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 10 "https://$ad/vmess" 2>/dev/null || true)
+            [[ -z "$code" ]] && code="000"
+            if [[ "$code" == "400" ]]; then say ok "临时隧道域名探针回 400"; else say fail "临时隧道域名探针回 $code（应为 400）"; fi
+        else
+            say fail "临时隧道域名还没拿到（看日志 $SB_CF_DIR/argo.log）"
+        fi
     fi
     echo "------------------------------------------"
     if (( fail == 0 )); then
         green "自检全部通过（$ok 项）"
-    else
-        red "自检：$ok 通过，$fail 失败"
+        return 0
     fi
-    return $(( fail > 0 ))
+    red "自检：$ok 通过，$fail 失败"
+    if (( fix == 1 )); then
+        yellow "尝试重启服务后复检…"
+        systemctl restart sing-box 2>/dev/null || true
+        [[ -n "${TUNNEL_DOMAIN:-}" ]] && systemctl restart cloudflared 2>/dev/null || true
+        [[ -n "${ARGO:-}" ]] && systemctl restart cloudflared-argo 2>/dev/null || true
+        sleep 3
+        local rc=0
+        do_check || rc=$?
+        return $rc
+    fi
+    yellow "提示：sb check --fix 可自动重启服务后复检"
+    return 1
 }
 
 show_info() {
@@ -529,6 +647,10 @@ show_info() {
     echo "Hysteria2 端口：$HY2_PORT（UDP）"
     echo "TUIC 端口：$TUIC_PORT（UDP）"
     [[ -n "${TUNNEL_DOMAIN:-}" ]] && echo "固定隧道：$TUNNEL_DOMAIN"
+    if [[ -n "${ARGO:-}" ]]; then
+        local ad; ad=$(get_argo_domain)
+        [[ -n "$ad" ]] && echo "临时隧道：$ad（重启后域名会变，以本次显示为准）" || echo "临时隧道：域名还没拿到，稍等再 sb show"
+    fi
     echo "------------------------------------------"
     cat "$LINKS_FILE"
     echo "------------------------------------------"
@@ -537,6 +659,9 @@ show_info() {
     echo "sing-box 状态：$(systemctl is-active sing-box 2>/dev/null || echo 未运行)"
     if [[ -n "${TUNNEL_DOMAIN:-}" ]]; then
         echo "cloudflared 状态：$(systemctl is-active cloudflared 2>/dev/null || echo 未运行)"
+    fi
+    if [[ -n "${ARGO:-}" ]]; then
+        echo "cloudflared 临时隧道状态：$(systemctl is-active cloudflared-argo 2>/dev/null || echo 未运行)"
     fi
     echo "管理命令：sb"
     blue "=========================================="
@@ -587,8 +712,12 @@ do_install() {
     NODE_NAME="${SB_NODE_NAME:-$NODE_NAME}"
     TUNNEL_TOKEN="${SB_TUNNEL_TOKEN:-}"
     TUNNEL_DOMAIN="${SB_TUNNEL_DOMAIN:-}"
+    ARGO="${SB_ARGO:-}"
     if [[ -n "$TUNNEL_TOKEN" && -z "$TUNNEL_DOMAIN" ]] || [[ -z "$TUNNEL_TOKEN" && -n "$TUNNEL_DOMAIN" ]]; then
         die "SB_TUNNEL_TOKEN 与 SB_TUNNEL_DOMAIN 必须同时给"
+    fi
+    if [[ -n "$TUNNEL_DOMAIN" && -n "$ARGO" ]]; then
+        die "固定隧道与临时隧道二选一，不要同时给"
     fi
     install_deps
     install_singbox
@@ -599,6 +728,7 @@ do_install() {
         NODE_NAME="${SB_NODE_NAME:-$NODE_NAME}"
         TUNNEL_TOKEN="${SB_TUNNEL_TOKEN:-${TUNNEL_TOKEN:-}}"
         TUNNEL_DOMAIN="${SB_TUNNEL_DOMAIN:-${TUNNEL_DOMAIN:-}}"
+        ARGO="${SB_ARGO:-${ARGO:-}}"
         if [[ -n "${SB_BASE_PORT:-}" || -n "${SB_REALITY_PORT:-}" || -n "${SB_VMESS_PORT:-}" || -n "${SB_HY2_PORT:-}" || -n "${SB_TUIC_PORT:-}" ]]; then
             resolve_ports
         fi
@@ -613,6 +743,8 @@ do_install() {
     enable_bbr
     if [[ -n "$TUNNEL_TOKEN" ]]; then
         write_tunnel
+    elif [[ -n "$ARGO" ]]; then
+        write_argo
     fi
     install_shortcut
     # ufw 开着就顺手放行
@@ -650,7 +782,7 @@ do_tunnel() {
     TUNNEL_TOKEN="$token"; TUNNEL_DOMAIN="$domain"
     save_params
     write_config
-    systemctl restart sing-box
+    systemctl restart sing-box || true
     write_tunnel
     show_info
     echo
@@ -662,6 +794,13 @@ do_update() {
     SB_VERSION="${SB_VERSION:-}"
     install_singbox
     systemctl restart sing-box
+    # cloudflared 也一起刷新（install_cloudflared 发现已安装会跳过，所以先删二进制）
+    if [[ -x "$SB_BIN_DIR/cloudflared" ]]; then
+        rm -f "$SB_BIN_DIR/cloudflared"
+        install_cloudflared
+        systemctl is-active -q cloudflared && systemctl restart cloudflared || true
+        systemctl is-active -q cloudflared-argo && systemctl restart cloudflared-argo || true
+    fi
     green "更新完成，当前版本：$("$SB_BIN_DIR/sing-box" version | head -n1)"
 }
 
@@ -669,6 +808,7 @@ do_restart() {
     check_root
     systemctl restart sing-box
     [[ -f "$SB_SVC_DIR/cloudflared.service" ]] && systemctl restart cloudflared || true
+    [[ -f "$SB_SVC_DIR/cloudflared-argo.service" ]] && systemctl restart cloudflared-argo || true
     systemctl is-active -q sing-box && green "sing-box 已重启，状态 active" || red "sing-box 重启后不是 active，看日志排查"
 }
 
@@ -681,12 +821,14 @@ do_uninstall() {
     # 逐个停，cloudflared 可能根本没装过（没配隧道时），不能让一个不存在的单元拖垮另一个的停止
     systemctl stop sing-box 2>/dev/null || true
     systemctl stop cloudflared 2>/dev/null || true
-    systemctl disable sing-box cloudflared 2>/dev/null || true
+    systemctl stop cloudflared-argo 2>/dev/null || true
+    systemctl disable sing-box cloudflared cloudflared-argo 2>/dev/null || true
     # 兜底：单元文件删掉后残留进程不会自己死，按精确命令行清理（只认本脚本的两个服务，别处的不碰）
     pkill -f "^/usr/local/bin/sing-box run -c /etc/sing-box/config.json$" 2>/dev/null || true
     pkill -f "^/usr/local/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run$" 2>/dev/null || true
+    pkill -f "cloudflared tunnel --url http://localhost" 2>/dev/null || true
     sleep 1
-    rm -f "$SB_SVC_DIR/sing-box.service" "$SB_SVC_DIR/cloudflared.service" \
+    rm -f "$SB_SVC_DIR/sing-box.service" "$SB_SVC_DIR/cloudflared.service" "$SB_SVC_DIR/cloudflared-argo.service" \
         "$SB_BIN_DIR/sing-box" "$SB_BIN_DIR/cloudflared" "$SB_BIN_DIR/sb" \
         /etc/sysctl.d/99-sb4-bbr.conf
     rm -rf "$SB_HOME" "$SB_CF_DIR"
@@ -715,21 +857,27 @@ menu() {
         echo "7. 更新 sing-box 内核"
         echo "8. 重启服务"
         echo "9. 卸载"
+        echo "10. 启用临时隧道（无需域名）"
         echo "0. 退出"
         echo "------------------------------------------"
-        read -rp "选一个 [0-9]： " n
+        read -rp "选一个 [0-10]： " n
         case "$n" in
             1)
                 # 一键安装：只问隧道，其他全默认
+                SB_ARGO=""
                 read -rp "固定隧道 token（没有直接回车跳过）：" p; SB_TUNNEL_TOKEN="$p"
                 if [[ -n "$p" ]]; then
                     read -rp "固定隧道域名：" p; SB_TUNNEL_DOMAIN="$p"
+                else
+                    read -rp "用临时隧道吗（无需域名，自动分配）？[y/N]：" p
+                    [[ "$p" == "y" || "$p" == "Y" ]] && SB_ARGO=1
                 fi
-                export SB_TUNNEL_TOKEN SB_TUNNEL_DOMAIN
+                export SB_TUNNEL_TOKEN SB_TUNNEL_DOMAIN SB_ARGO
                 do_install
                 ;;
             2)
                 # 自定义安装：端口与伪装域名现问现装
+                SB_ARGO=""
                 read -rp "VLESS+REALITY 端口 [默认 443]：" p; SB_REALITY_PORT="${p:-443}"
                 read -rp "VMess+WS 端口 [默认 10086]：" p; SB_VMESS_PORT="${p:-10086}"
                 read -rp "Hysteria2 端口 [默认 8443]：" p; SB_HY2_PORT="${p:-8443}"
@@ -738,8 +886,11 @@ menu() {
                 read -rp "固定隧道 token（没有直接回车跳过）：" p; SB_TUNNEL_TOKEN="$p"
                 if [[ -n "$p" ]]; then
                     read -rp "固定隧道域名：" p; SB_TUNNEL_DOMAIN="$p"
+                else
+                    read -rp "用临时隧道吗（无需域名，自动分配）？[y/N]：" p
+                    [[ "$p" == "y" || "$p" == "Y" ]] && SB_ARGO=1
                 fi
-                export SB_REALITY_PORT SB_VMESS_PORT SB_HY2_PORT SB_TUIC_PORT SB_SNI SB_TUNNEL_TOKEN SB_TUNNEL_DOMAIN
+                export SB_REALITY_PORT SB_VMESS_PORT SB_HY2_PORT SB_TUIC_PORT SB_SNI SB_TUNNEL_TOKEN SB_TUNNEL_DOMAIN SB_ARGO
                 do_install
                 ;;
             3) show_info ;;
@@ -749,8 +900,9 @@ menu() {
             7) do_update ;;
             8) do_restart ;;
             9) do_uninstall ;;
+            10) do_argo ;;
             0) exit 0 ;;
-            *) red "输 0-9" ;;
+            *) red "输 0-10" ;;
         esac
         echo
         read -rp "按回车返回菜单..." _
@@ -761,11 +913,12 @@ menu() {
 case "${1:-menu}" in
     install)   do_install ;;
     show)      show_info ;;
-    check)     do_check ;;
+    check)     do_check "${2:-}" ;;
     update)    do_update ;;
     restart)   do_restart ;;
     uninstall) do_uninstall "${2:-}" ;;
     tunnel)    do_tunnel ;;
+    argo)      do_argo ;;
     menu)      menu ;;
-    *) echo "用法：bash install.sh [install|show|check|update|restart|uninstall|tunnel|menu]"; exit 1 ;;
+    *) echo "用法：bash install.sh [install|show|check|update|restart|uninstall|tunnel|argo|menu]"; exit 1 ;;
 esac
