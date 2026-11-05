@@ -154,6 +154,7 @@ latest_singbox_version() {
 }
 
 install_singbox() {
+    [[ -n "${ARCH:-}" ]] || detect_arch  # update/tunnel 等子命令不走 do_install，也要能认架构
     local ver="${SB_VERSION:-$(latest_singbox_version)}"
     if [[ -x "$SB_BIN_DIR/sing-box" ]]; then
         local cur
@@ -183,6 +184,7 @@ install_singbox() {
 }
 
 install_cloudflared() {
+    [[ -n "${ARCH:-}" ]] || detect_arch  # tunnel 子命令不走 do_install，也要能认架构
     if [[ -x "$SB_BIN_DIR/cloudflared" ]]; then
         green "cloudflared 已安装，跳过"
         return 0
@@ -364,9 +366,23 @@ write_tunnel() {
     # TUNNEL_TOKEN / TUNNEL_DOMAIN 由调用方保证非空
     install_cloudflared
     mkdir -p "$SB_CF_DIR"
+    # token 是 base64(JSON{a,t,s})，cloudflared 配置里 tunnel: 不能直接放 token
+    # （会当成 tunnel ID 解析并索要 origin cert），要解成 credentials 文件
+    local b64 cred_json tunnel_id tunnel_secret account_tag
+    b64=$(echo -n "$TUNNEL_TOKEN" | tr '_-' '/+')
+    while (( ${#b64} % 4 != 0 )); do b64="${b64}="; done
+    cred_json=$(echo -n "$b64" | base64 -d 2>/dev/null) || die "隧道 token 解码失败"
+    tunnel_id=$(echo "$cred_json" | jq -r '.t // empty')
+    tunnel_secret=$(echo "$cred_json" | jq -r '.s // empty')
+    account_tag=$(echo "$cred_json" | jq -r '.a // empty')
+    [[ -n "$tunnel_id" && -n "$tunnel_secret" && -n "$account_tag" ]] || die "隧道 token 格式不对（缺 a/t/s）"
+    cat > "$SB_CF_DIR/creds.json" <<EOF
+{"AccountTag":"$account_tag","TunnelID":"$tunnel_id","TunnelSecret":"$tunnel_secret"}
+EOF
+    chmod 600 "$SB_CF_DIR/creds.json"
     cat > "$SB_CF_DIR/config.yml" <<EOF
-# Cloudflare 固定隧道（token 只存本机此文件，权限 600）
-tunnel: $TUNNEL_TOKEN
+tunnel: $tunnel_id
+credentials-file: $SB_CF_DIR/creds.json
 no-autoupdate: true
 ingress:
   - hostname: $TUNNEL_DOMAIN
@@ -390,8 +406,15 @@ RestartSec=5s
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now cloudflared
-    sleep 3
+    systemctl enable cloudflared
+    # 必须是 restart：换隧道重跑时服务已在跑，start 对已运行的服务是空操作，旧配置会继续生效
+    systemctl restart cloudflared
+    # 连接器启动后还要握手，轮询最多 20 秒再下结论
+    local i
+    for i in $(seq 1 10); do
+        sleep 2
+        systemctl is-active -q cloudflared && break
+    done
     if systemctl is-active -q cloudflared; then
         green "cloudflared 已启动"
     else
